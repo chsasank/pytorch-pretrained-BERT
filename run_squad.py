@@ -50,15 +50,22 @@ class SquadExample(object):
                  qas_id,
                  question_text,
                  doc_tokens,
+                 is_impossible=None,
                  orig_answer_text=None,
                  start_position=None,
                  end_position=None):
         self.qas_id = qas_id
         self.question_text = question_text
         self.doc_tokens = doc_tokens
+        self.is_impossible = is_impossible
         self.orig_answer_text = orig_answer_text
         self.start_position = start_position
         self.end_position = end_position
+
+        if self.is_impossible == False:
+            assert self.orig_answer_text is not None
+            assert self.start_position is not None
+            assert self.end_position is not None
 
     def __str__(self):
         return self.__repr__()
@@ -69,6 +76,7 @@ class SquadExample(object):
         s += ", question_text: %s" % (
             tokenization.printable_text(self.question_text))
         s += ", doc_tokens: [%s]" % (" ".join(self.doc_tokens))
+        s += ", is_impossible: %s" % (self.is_impossible)
         if self.start_position:
             s += ", start_position: %d" % (self.start_position)
         if self.start_position:
@@ -89,6 +97,7 @@ class InputFeatures(object):
                  input_ids,
                  input_mask,
                  segment_ids,
+                 is_impossible=None,
                  start_position=None,
                  end_position=None):
         self.unique_id = unique_id
@@ -100,14 +109,22 @@ class InputFeatures(object):
         self.input_ids = input_ids
         self.input_mask = input_mask
         self.segment_ids = segment_ids
+        self.is_impossible = is_impossible
         self.start_position = start_position
         self.end_position = end_position
+
+        if self.is_impossible:
+            # very large value, so that they are ignored
+            self.start_position = 1000000000
+            self.end_position = 1000000000
 
 
 def read_squad_examples(input_file, is_training):
     """Read a SQuAD json file into a list of SquadExample."""
     with open(input_file, "r") as reader:
-        input_data = json.load(reader)["data"]
+        json_data = json.load(reader)
+        input_data = json_data["data"]
+        version = json_data["version"]
 
     def is_whitespace(c):
         if c == " " or c == "\t" or c == "\r" or c == "\n" or ord(c) == 0x202F:
@@ -138,34 +155,46 @@ def read_squad_examples(input_file, is_training):
                 start_position = None
                 end_position = None
                 orig_answer_text = None
+                is_impossible = None
                 if is_training:
-                    if len(qa["answers"]) != 1:
+                    if len(qa["answers"]) not in {0, 1}:
                         raise ValueError(
-                            "For training, each question should have exactly 1 answer.")
-                    answer = qa["answers"][0]
-                    orig_answer_text = answer["text"]
-                    answer_offset = answer["answer_start"]
-                    answer_length = len(orig_answer_text)
-                    start_position = char_to_word_offset[answer_offset]
-                    end_position = char_to_word_offset[answer_offset + answer_length - 1]
-                    # Only add answers where the text can be exactly recovered from the
-                    # document. If this CAN'T happen it's likely due to weird Unicode
-                    # stuff so we will just skip the example.
-                    #
-                    # Note that this means for training mode, every example is NOT
-                    # guaranteed to be preserved.
-                    actual_text = " ".join(doc_tokens[start_position:(end_position + 1)])
-                    cleaned_answer_text = " ".join(
-                        tokenization.whitespace_tokenize(orig_answer_text))
-                    if actual_text.find(cleaned_answer_text) == -1:
-                        logger.warning("Could not find answer: '%s' vs. '%s'",
-                                           actual_text, cleaned_answer_text)
-                        continue
+                            "For training, each question should have exactly 1 or no answer.")
+                    elif len(qa["answers"]) == 0 and version != 'v2.0':
+                        raise ValueError(
+                            'Only squad v2.0 supports impossible answers')
+
+                    try:
+                        is_impossible = qa["is_impossible"]
+                    except KeyError:
+                        is_impossible = False
+
+                    if not is_impossible:
+                        answer = qa["answers"][0]
+                        orig_answer_text = answer["text"]
+                        answer_offset = answer["answer_start"]
+                        answer_length = len(orig_answer_text)
+                        start_position = char_to_word_offset[answer_offset]
+                        end_position = char_to_word_offset[answer_offset + answer_length - 1]
+                        # Only add answers where the text can be exactly recovered from the
+                        # document. If this CAN'T happen it's likely due to weird Unicode
+                        # stuff so we will just skip the example.
+                        #
+                        # Note that this means for training mode, every example is NOT
+                        # guaranteed to be preserved.
+                        actual_text = " ".join(doc_tokens[start_position:(end_position + 1)])
+                        cleaned_answer_text = " ".join(
+                            tokenization.whitespace_tokenize(orig_answer_text))
+                        if actual_text.find(cleaned_answer_text) == -1:
+                            logger.warning("Could not find answer: '%s' vs. '%s'",
+                                               actual_text, cleaned_answer_text)
+                            continue
 
                 example = SquadExample(
                     qas_id=qas_id,
                     question_text=question_text,
                     doc_tokens=doc_tokens,
+                    is_impossible=is_impossible,
                     orig_answer_text=orig_answer_text,
                     start_position=start_position,
                     end_position=end_position)
@@ -180,7 +209,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
     unique_id = 1000000000
 
     features = []
-    for (example_index, example) in enumerate(examples):
+    for (example_index, example) in enumerate(tqdm(examples)):
         query_tokens = tokenizer.tokenize(example.question_text)
 
         if len(query_tokens) > max_query_length:
@@ -198,15 +227,18 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
 
         tok_start_position = None
         tok_end_position = None
+        is_impossible = None
         if is_training:
-            tok_start_position = orig_to_tok_index[example.start_position]
-            if example.end_position < len(example.doc_tokens) - 1:
-                tok_end_position = orig_to_tok_index[example.end_position + 1] - 1
-            else:
-                tok_end_position = len(all_doc_tokens) - 1
-            (tok_start_position, tok_end_position) = _improve_answer_span(
-                all_doc_tokens, tok_start_position, tok_end_position, tokenizer,
-                example.orig_answer_text)
+            is_impossible = example.is_impossible
+            if not is_impossible:
+                tok_start_position = orig_to_tok_index[example.start_position]
+                if example.end_position < len(example.doc_tokens) - 1:
+                    tok_end_position = orig_to_tok_index[example.end_position + 1] - 1
+                else:
+                    tok_end_position = len(all_doc_tokens) - 1
+                (tok_start_position, tok_end_position) = _improve_answer_span(
+                    all_doc_tokens, tok_start_position, tok_end_position, tokenizer,
+                    example.orig_answer_text)
 
         # The -3 accounts for [CLS], [SEP] and [SEP]
         max_tokens_for_doc = max_seq_length - len(query_tokens) - 3
@@ -271,18 +303,19 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
             start_position = None
             end_position = None
             if is_training:
-                # For training, if our document chunk does not contain an annotation
-                # we throw it out, since there is nothing to predict.
-                doc_start = doc_span.start
-                doc_end = doc_span.start + doc_span.length - 1
-                if (example.start_position < doc_start or
-                        example.end_position < doc_start or
-                        example.start_position > doc_end or example.end_position > doc_end):
-                    continue
+                if not is_impossible:
+                    # For training, if our document chunk does not contain an annotation
+                    # we throw it out, since there is nothing to predict.
+                    doc_start = doc_span.start
+                    doc_end = doc_span.start + doc_span.length - 1
+                    if (example.start_position < doc_start or
+                            example.end_position < doc_start or
+                            example.start_position > doc_end or example.end_position > doc_end):
+                        continue
 
-                doc_offset = len(query_tokens) + 2
-                start_position = tok_start_position - doc_start + doc_offset
-                end_position = tok_end_position - doc_start + doc_offset
+                    doc_offset = len(query_tokens) + 2
+                    start_position = tok_start_position - doc_start + doc_offset
+                    end_position = tok_end_position - doc_start + doc_offset
 
             if example_index < 20:
                 logger.info("*** Example ***")
@@ -302,11 +335,13 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                 logger.info(
                     "segment_ids: %s" % " ".join([str(x) for x in segment_ids]))
                 if is_training:
-                    answer_text = " ".join(tokens[start_position:(end_position + 1)])
-                    logger.info("start_position: %d" % (start_position))
-                    logger.info("end_position: %d" % (end_position))
-                    logger.info(
-                        "answer: %s" % (tokenization.printable_text(answer_text)))
+                    logger.info("is_impossible: %s" % (is_impossible))
+                    if not is_impossible:
+                        answer_text = " ".join(tokens[start_position:(end_position + 1)])
+                        logger.info("start_position: %d" % (start_position))
+                        logger.info("end_position: %d" % (end_position))
+                        logger.info(
+                            "answer: %s" % (tokenization.printable_text(answer_text)))
 
             features.append(
                 InputFeatures(
@@ -319,6 +354,7 @@ def convert_examples_to_features(examples, tokenizer, max_seq_length,
                     input_ids=input_ids,
                     input_mask=input_mask,
                     segment_ids=segment_ids,
+                    is_impossible=is_impossible,
                     start_position=start_position,
                     end_position=end_position))
             unique_id += 1
@@ -402,14 +438,15 @@ def _check_is_max_context(doc_spans, cur_span_index, position):
 
 
 RawResult = collections.namedtuple("RawResult",
-                                   ["unique_id", "start_logits", "end_logits"])
+                                   ["unique_id", "is_impossible_logits", "start_logits", "end_logits"])
 
 
 def write_predictions(all_examples, all_features, all_results, n_best_size,
                       max_answer_length, do_lower_case, output_prediction_file,
-                      output_nbest_file, verbose_logging):
+                      output_na_prob_file, output_nbest_file, verbose_logging):
     """Write final predictions to the json file."""
     logger.info("Writing predictions to: %s" % (output_prediction_file))
+    logger.info("Writing no answer probability file to: %s" % (output_na_prob_file))
     logger.info("Writing nbest to: %s" % (output_nbest_file))
 
     example_index_to_features = collections.defaultdict(list)
@@ -422,10 +459,12 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
 
     _PrelimPrediction = collections.namedtuple(  # pylint: disable=invalid-name
         "PrelimPrediction",
-        ["feature_index", "start_index", "end_index", "start_logit", "end_logit"])
+        ["feature_index", "start_index", "end_index", "is_impossible_logits", "start_logit", "end_logit"])
 
     all_predictions = collections.OrderedDict()
+    all_na_probs = collections.OrderedDict()
     all_nbest_json = collections.OrderedDict()
+
     for (example_index, example) in enumerate(all_examples):
         features = example_index_to_features[example_index]
 
@@ -460,6 +499,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
                             feature_index=feature_index,
                             start_index=start_index,
                             end_index=end_index,
+                            is_impossible_logits=result.is_impossible_logits,
                             start_logit=result.start_logits[start_index],
                             end_logit=result.end_logits[end_index]))
 
@@ -469,7 +509,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
             reverse=True)
 
         _NbestPrediction = collections.namedtuple(  # pylint: disable=invalid-name
-            "NbestPrediction", ["text", "start_logit", "end_logit"])
+            "NbestPrediction", ["text", "is_impossible_logits", "start_logit", "end_logit"])
 
         seen_predictions = {}
         nbest = []
@@ -501,6 +541,7 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
             nbest.append(
                 _NbestPrediction(
                     text=final_text,
+                    is_impossible_logits=pred.is_impossible_logits,
                     start_logit=pred.start_logit,
                     end_logit=pred.end_logit))
 
@@ -508,7 +549,8 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
         # just create a nonce prediction in this case to avoid failure.
         if not nbest:
             nbest.append(
-                _NbestPrediction(text="empty", start_logit=0.0, end_logit=0.0))
+                _NbestPrediction(text="empty", is_impossible_logits=[0.0, 0.0],
+                                 start_logit=0.0, end_logit=0.0))
 
         assert len(nbest) >= 1
 
@@ -523,6 +565,8 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
             output = collections.OrderedDict()
             output["text"] = entry.text
             output["probability"] = probs[i]
+            output["is_impossible_prob"] = _compute_softmax(
+                list(entry.is_impossible_logits))[1]
             output["start_logit"] = entry.start_logit
             output["end_logit"] = entry.end_logit
             nbest_json.append(output)
@@ -530,10 +574,14 @@ def write_predictions(all_examples, all_features, all_results, n_best_size,
         assert len(nbest_json) >= 1
 
         all_predictions[example.qas_id] = nbest_json[0]["text"]
+        all_na_probs[example.qas_id] = nbest_json[0]["is_impossible_prob"]
         all_nbest_json[example.qas_id] = nbest_json
 
     with open(output_prediction_file, "w") as writer:
         writer.write(json.dumps(all_predictions, indent=4) + "\n")
+
+    with open(output_na_prob_file, "w") as writer:
+        writer.write(json.dumps(all_na_probs, indent=4) + "\n")
 
     with open(output_nbest_file, "w") as writer:
         writer.write(json.dumps(all_nbest_json, indent=4) + "\n")
@@ -843,11 +891,12 @@ def main():
         all_input_ids = torch.tensor([f.input_ids for f in train_features], dtype=torch.long)
         all_input_mask = torch.tensor([f.input_mask for f in train_features], dtype=torch.long)
         all_segment_ids = torch.tensor([f.segment_ids for f in train_features], dtype=torch.long)
+        all_is_impossible = torch.tensor([f.is_impossible for f in train_features], dtype=torch.long)
         all_start_positions = torch.tensor([f.start_position for f in train_features], dtype=torch.long)
         all_end_positions = torch.tensor([f.end_position for f in train_features], dtype=torch.long)
 
         train_data = TensorDataset(all_input_ids, all_input_mask, all_segment_ids,
-                                   all_start_positions, all_end_positions)
+                                   all_is_impossible, all_start_positions, all_end_positions)
         if args.local_rank == -1:
             train_sampler = RandomSampler(train_data)
         else:
@@ -856,26 +905,30 @@ def main():
 
         model.train()
         for epoch in trange(int(args.num_train_epochs), desc="Epoch"):
-            for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration")):
-                input_ids, input_mask, segment_ids, start_positions, end_positions = batch
-                input_ids = input_ids.to(device)
-                input_mask = input_mask.to(device)
-                segment_ids = segment_ids.to(device)
-                start_positions = start_positions.to(device)
-                end_positions = start_positions.to(device)
+            with tqdm(train_dataloader, desc="Iteration") as t:
+                for step, batch in enumerate(t):
+                    input_ids, input_mask, segment_ids, is_impossible, start_positions, end_positions = batch
+                    input_ids = input_ids.to(device)
+                    input_mask = input_mask.to(device)
+                    segment_ids = segment_ids.to(device)
+                    is_impossible = is_impossible.to(device)
+                    start_positions = start_positions.to(device)
+                    end_positions = start_positions.to(device)
 
-                start_positions = start_positions.view(-1, 1)
-                end_positions = end_positions.view(-1, 1)
+                    start_positions = start_positions.view(-1, 1)
+                    end_positions = end_positions.view(-1, 1)
 
-                loss, _ = model(input_ids, segment_ids, input_mask, start_positions, end_positions)
-                if n_gpu > 1:
-                    loss = loss.mean() # mean() to average on multi-gpu.
+                    loss, _ = model(input_ids, segment_ids, input_mask, is_impossible, start_positions, end_positions)
+                    if n_gpu > 1:
+                        loss = loss.mean() # mean() to average on multi-gpu.
 
-                loss.backward()
-                if (step + 1) % args.gradient_accumulation_steps == 0:
-                    optimizer.step()    # We have accumulated enought gradients
-                    model.zero_grad()
-                    global_step += 1
+                    loss.backward()
+                    if (step + 1) % args.gradient_accumulation_steps == 0:
+                        optimizer.step()    # We have accumulated enought gradients
+                        model.zero_grad()
+                        global_step += 1
+
+                    t.set_postfix(loss=loss.item())
 
     if args.do_predict:
         eval_examples = read_squad_examples(
@@ -916,9 +969,10 @@ def main():
             input_mask = input_mask.to(device)
             segment_ids = segment_ids.to(device)
 
-            start_logits, end_logits = model(input_ids, segment_ids, input_mask)
+            is_impossible_logits, start_logits, end_logits = model(input_ids, segment_ids, input_mask)
 
             unique_id = [int(eval_features[e.item()].unique_id) for e in example_index]
+            is_impossible_logits = is_impossible_logits.detach().cpu().numpy()
             start_logits = [x.view(-1).detach().cpu().numpy() for x in start_logits]
             end_logits = [x.view(-1).detach().cpu().numpy() for x in end_logits]
             for idx, i in enumerate(unique_id):
@@ -927,6 +981,7 @@ def main():
                 all_results.append(
                     RawResult(
                         unique_id=i,
+                        is_impossible_logits=is_impossible_logits[idx],
                         start_logits=s,
                         end_logits=e
                     )
@@ -934,11 +989,14 @@ def main():
 
         output_prediction_file = os.path.join(args.output_dir, "predictions.json")
         output_nbest_file = os.path.join(args.output_dir, "nbest_predictions.json")
+        output_na_prob_file = os.path.join(args.output_dir, "na_prob.json")
+
         write_predictions(eval_examples, eval_features, all_results,
                           args.n_best_size, args.max_answer_length,
                           args.do_lower_case, output_prediction_file,
-                          output_nbest_file, args.verbose_logging)
+                          output_na_prob_file, output_nbest_file, args.verbose_logging)
 
+        torch.save(model.state_dict(), 'squad_model.pth')
 
 if __name__ == "__main__":
     main()

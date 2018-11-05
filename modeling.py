@@ -431,7 +431,9 @@ class BertForQuestionAnswering(nn.Module):
         super(BertForQuestionAnswering, self).__init__()
         self.bert = BertModel(config)
         # TODO check with Google if it's normal there is no dropout on the token classifier of SQuAD in the TF version
-        # self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.is_impossible_classifier = nn.Linear(config.hidden_size, 2)
+
         self.qa_outputs = nn.Linear(config.hidden_size, 2)
 
         def init_weights(module):
@@ -446,15 +448,19 @@ class BertForQuestionAnswering(nn.Module):
                 module.bias.data.zero_()
         self.apply(init_weights)
 
-    def forward(self, input_ids, token_type_ids, attention_mask, start_positions=None, end_positions=None):
-        all_encoder_layers, _ = self.bert(input_ids, token_type_ids, attention_mask)
+    def forward(self, input_ids, token_type_ids, attention_mask, is_impossible=None, start_positions=None, end_positions=None):
+        all_encoder_layers, pooled_output = self.bert(input_ids, token_type_ids, attention_mask)
+
         sequence_output = all_encoder_layers[-1]
         logits = self.qa_outputs(sequence_output)
         start_logits, end_logits = logits.split(1, dim=-1)
         start_logits = start_logits.squeeze(-1)
         end_logits = end_logits.squeeze(-1)
 
-        if start_positions is not None and end_positions is not None:
+        pooled_output = self.dropout(pooled_output)
+        is_impossible_logits = self.is_impossible_classifier(pooled_output)
+
+        if is_impossible is not None and start_positions is not None and end_positions is not None:
             # If we are on multi-GPU, split add a dimension - if not this is a no-op
             start_positions = start_positions.squeeze(-1)
             end_positions = end_positions.squeeze(-1)
@@ -466,7 +472,11 @@ class BertForQuestionAnswering(nn.Module):
             loss_fct = CrossEntropyLoss(ignore_index=ignored_index)
             start_loss = loss_fct(start_logits, start_positions)
             end_loss = loss_fct(end_logits, end_positions)
-            total_loss = (start_loss + end_loss) / 2
-            return total_loss, (start_logits, end_logits)
+
+            is_impossible_loss_fct = CrossEntropyLoss()
+            is_impossible_loss = is_impossible_loss_fct(is_impossible_logits, is_impossible)
+
+            total_loss = is_impossible_loss / 2 + (start_loss + end_loss) / 4
+            return total_loss, (is_impossible_logits, start_logits, end_logits)
         else:
-            return start_logits, end_logits
+            return is_impossible_logits, start_logits, end_logits
